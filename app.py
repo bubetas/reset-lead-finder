@@ -1254,6 +1254,14 @@ def get_secret(name: str, default: str = "") -> str:
         value = os.environ.get(name, default)
     return str(value or "").strip()
 
+def get_first_secret(*names: str) -> tuple[str, str]:
+    """Return the first configured secret and the name that matched, without exposing its value."""
+    for name in names:
+        value = get_secret(name)
+        if value:
+            return value, name
+    return "", ""
+
 def require_login() -> None:
     expected = get_secret("APP_PASSWORD")
     if not expected:
@@ -1290,12 +1298,49 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-stored_tavily_key = get_secret("TAVILY_API_KEY")
-stored_abstract_key = get_secret("ABSTRACT_API_KEY")
-stored_lusha_key = get_secret("LUSHA_API_KEY")
+stored_tavily_key, tavily_secret_name = get_first_secret("TAVILY_API_KEY", "TAVILY_KEY", "tavily_api_key")
+stored_abstract_key, abstract_secret_name = get_first_secret("ABSTRACT_API_KEY", "ABSTRACT_KEY", "abstract_api_key")
+stored_lusha_key, lusha_secret_name = get_first_secret("LUSHA_API_KEY", "LUSHA_KEY", "lusha_api_key")
+
+# Always-visible connection status — independent of uploaded files and selected tab.
+st.markdown("### API bağlantıları")
+status_col1, status_col2, status_col3 = st.columns(3)
+with status_col1:
+    if stored_tavily_key:
+        st.success("✓ Tavily API bağlı")
+        st.caption(f"Secrets: `{tavily_secret_name}`")
+    else:
+        st.error("Tavily API bağlı değil")
+        st.caption("Secrets içine `TAVILY_API_KEY` ekle.")
+with status_col2:
+    if stored_abstract_key:
+        st.success("✓ Abstract API bağlı")
+        st.caption(f"Secrets: `{abstract_secret_name}`")
+    else:
+        st.error("Abstract API bağlı değil")
+        st.caption("Secrets içine `ABSTRACT_API_KEY` ekle.")
+with status_col3:
+    if stored_lusha_key:
+        st.success("✓ Lusha API bağlı")
+        st.caption(f"Secrets: `{lusha_secret_name}`")
+    else:
+        st.error("Lusha API bağlı değil")
+        st.caption("Secrets içine `LUSHA_API_KEY` ekle ve uygulamayı Reboot et.")
+
+with st.expander("Bağlantı tanılama", expanded=not bool(stored_lusha_key)):
+    st.write({
+        "Uygulama sürümü": "v10.1",
+        "Tavily secret bulundu": bool(stored_tavily_key),
+        "Abstract secret bulundu": bool(stored_abstract_key),
+        "Lusha secret bulundu": bool(stored_lusha_key),
+    })
+    if not stored_lusha_key:
+        st.warning("Lusha anahtarı okunamadı. Secret adı tam olarak `LUSHA_API_KEY` olmalı. Save sonrası Streamlit Cloud'da Reboot app yap.")
+    else:
+        st.info("Lusha anahtarı sunucuda bulundu. Anahtar değeri güvenlik nedeniyle ekranda gösterilmez.")
 
 with st.sidebar:
-    st.markdown("""<div class="reset-side-brand"><div class="reset-side-mark">RE<span>:</span>SET</div><div class="reset-side-caption">Lead Intelligence · v10</div></div>""", unsafe_allow_html=True)
+    st.markdown("""<div class="reset-side-brand"><div class="reset-side-mark">RE<span>:</span>SET</div><div class="reset-side-caption">Lead Intelligence · v10.1</div></div>""", unsafe_allow_html=True)
     st.header("Bağlantılar")
     if stored_tavily_key:
         api_key = stored_tavily_key
@@ -1311,7 +1356,7 @@ with st.sidebar:
         st.markdown("[Abstract paneli](https://app.abstractapi.com/)")
     if stored_lusha_key:
         lusha_key = stored_lusha_key
-        st.success("Lusha API bağlı")
+        st.success("✓ Lusha API bağlı")
     else:
         lusha_key = st.text_input("Lusha API anahtarı — isteğe bağlı", type="password", help="Lusha API erişimin varsa gir. Abstract başarısız olduğunda devreye girer.")
         st.markdown("[Lusha API ayarları](https://dashboard.lusha.com/)")
