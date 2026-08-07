@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import hmac
 import os
 import re
@@ -23,6 +24,7 @@ SAMPLE_EMAIL_FILE = APP_DIR / "data" / "oncelikli_25_ornek.xlsx"
 SAMPLE_VERIFIED_FILE = APP_DIR / "data" / "dogrulanmis_5_ornek.xlsx"
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 ABSTRACT_ENDPOINT = "https://emailreputation.abstractapi.com/v1/"
+LUSHA_ENDPOINT = "https://api.lusha.com/v3/contacts/search-and-enrich"
 
 ROLE_GROUPS: dict[str, dict[str, list[str]]] = {
     "Pazarlama & Marka": {
@@ -203,7 +205,7 @@ def tavily_search(api_key: str, query: str, count: int = 5, include_domains: lis
         payload["include_domains"] = include_domains
     response = requests.post(
         TAVILY_ENDPOINT,
-        headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "ResetLeadFinder/9.0"},
+        headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "ResetLeadFinder/10.0"},
         json=payload,
         timeout=timeout,
     )
@@ -395,7 +397,7 @@ def fetch_public_site_emails(domain: str) -> tuple[set[str], list[str]]:
     emails: set[str] = set()
     sources: list[str] = []
     paths = ["/", "/iletisim", "/contact", "/contact-us", "/kurumsal/iletisim", "/tr/iletisim"]
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; ResetLeadFinder/9.0; public-contact-research)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; ResetLeadFinder/10.0; public-contact-research)"}
     for path in paths:
         url = urljoin(f"https://{domain}", path)
         try:
@@ -498,7 +500,7 @@ def abstract_verify(api_key: str, email: str, timeout: int = 30) -> dict:
     response = requests.get(
         ABSTRACT_ENDPOINT,
         params={"api_key": api_key.strip(), "email": email},
-        headers={"Accept": "application/json", "User-Agent": "ResetLeadFinder/9.0"},
+        headers={"Accept": "application/json", "User-Agent": "ResetLeadFinder/10.0"},
         timeout=timeout,
     )
     if response.status_code in (401, 403):
@@ -570,7 +572,324 @@ def verify_candidates(abstract_key: str, candidates: list[str], max_checks: int 
     return fallback, fallback_status or "undeliverable", checks
 
 
-def enrich_emails(api_key: str, abstract_key: str, source_df: pd.DataFrame, company_col: str, name_col: str, role_col: str | None, priority_col: str | None, linkedin_col: str | None, provided_domain_col: str | None, delay: float, max_verifications: int = 4) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+def split_name_for_lusha(name: str) -> tuple[str, str]:
+    """Lusha için adı ilk ad + son soyad şeklinde ayırır."""
+    raw = re.sub(r"\([^)]*\)", " ", str(name or ""))
+    raw = raw.replace("–", " ").replace("—", " ")
+    tokens = [x.strip(".,;:/") for x in raw.split() if x.strip(".,;:/")]
+    tokens = [x for x in tokens if ascii_slug(x) not in NAME_SUFFIXES]
+    if len(tokens) < 2:
+        return (tokens[0], "") if tokens else ("", "")
+    return tokens[0], tokens[-1]
+
+
+def lusha_match_score(original_name: str, original_company: str, original_linkedin: str, result: dict) -> tuple[int, str]:
+    """Yanlış kişi eşleşmesini azaltmak için Lusha sonucunu giriş kaydıyla kıyaslar."""
+    score = 0
+    returned_name = str(result.get("fullName") or f"{result.get('firstName', '')} {result.get('lastName', '')}").strip()
+    returned_company = str((result.get("company") or {}).get("name") or "")
+    returned_domain = str((result.get("company") or {}).get("domain") or "")
+    social = result.get("socialLinks") or {}
+    returned_linkedin = str(social.get("linkedin") or social.get("linkedinUrl") or "").strip()
+
+    if original_linkedin and returned_linkedin:
+        a = original_linkedin.lower().split("?")[0].rstrip("/")
+        b = returned_linkedin.lower().split("?")[0].rstrip("/")
+        if a == b:
+            score += 100
+
+    original_parts = clean_name_parts(original_name)
+    returned_parts = clean_name_parts(returned_name)
+    if original_parts and returned_parts:
+        if original_parts[0] == returned_parts[0]:
+            score += 28
+        if original_parts[-1] == returned_parts[-1]:
+            score += 42
+        if " ".join(original_parts) == " ".join(returned_parts):
+            score += 20
+
+    comp_text = normalize_text(f"{returned_company} {returned_domain}")
+    tokens = company_tokens(original_company)
+    if tokens and any(token in comp_text for token in tokens):
+        score += 25
+
+    score = min(100, score)
+    if score >= 75:
+        return score, "Yüksek"
+    if score >= 50:
+        return score, "Orta"
+    return score, "Düşük"
+
+
+def lusha_search_and_enrich(api_key: str, contacts: list[dict], reveal_email: bool = True,
+                            reveal_phone: bool = False, timeout: int = 90) -> dict:
+    """Lusha V3 search-and-enrich. Bir istekte en fazla 100 kişi gönderilir."""
+    if not api_key.strip() or not contacts:
+        return {"results": [], "billing": {}}
+    if len(contacts) > 100:
+        raise ValueError("Lusha tek istekte en fazla 100 kişi kabul eder.")
+    reveal: list[str] = []
+    if reveal_email:
+        reveal.append("emails")
+    if reveal_phone:
+        reveal.append("phones")
+    payload: dict = {"contacts": contacts}
+    if reveal:
+        payload["reveal"] = reveal
+    response = requests.post(
+        LUSHA_ENDPOINT,
+        headers={
+            "api_key": api_key.strip(),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "ResetLeadFinder/10.0",
+        },
+        json=payload,
+        timeout=timeout,
+    )
+    if response.status_code in (401, 403):
+        raise RuntimeError("Lusha API anahtarı geçersiz veya hesabında API erişimi yok.")
+    if response.status_code == 402:
+        raise RuntimeError("Lusha kredisi veya API anahtarı kredi limiti tükendi.")
+    if response.status_code == 429:
+        raise RuntimeError("Lusha hız sınırına ulaşıldı. Bir süre sonra tekrar dene.")
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("message") or response.text[:500]
+        except Exception:
+            detail = response.text[:500]
+        raise RuntimeError(f"Lusha API hatası ({response.status_code}): {detail}")
+    data = response.json()
+    if not isinstance(data.get("results"), list):
+        raise RuntimeError("Lusha yanıtında results listesi bulunamadı.")
+    return data
+
+
+def parse_lusha_result(result: dict) -> dict:
+    error = result.get("error") or {}
+    if error:
+        code = str(error.get("code") or "ERROR")
+        message = str(error.get("message") or "")
+        return {
+            "status": "not_found" if code == "NOT_FOUND" else "error",
+            "error_code": code,
+            "error_message": message,
+            "raw": result,
+        }
+    emails = result.get("emails") or []
+    phones = result.get("phones") or []
+    job = result.get("jobTitle") or {}
+    company = result.get("company") or {}
+    social = result.get("socialLinks") or {}
+    first_email = emails[0] if emails else {}
+    first_phone = phones[0] if phones else {}
+    return {
+        "status": "success",
+        "id": str(result.get("id") or ""),
+        "full_name": str(result.get("fullName") or f"{result.get('firstName', '')} {result.get('lastName', '')}").strip(),
+        "email": str(first_email.get("email") or "").strip().lower(),
+        "email_type": str(first_email.get("type") or ""),
+        "email_confidence": str(first_email.get("confidence") or ""),
+        "email_updated": str(first_email.get("updateDate") or ""),
+        "phone": str(first_phone.get("number") or ""),
+        "do_not_call": bool(first_phone.get("doNotCall")) if first_phone else False,
+        "job_title": str(job.get("title") or ""),
+        "job_seniority": str(job.get("seniority") or ""),
+        "company_name": str(company.get("name") or ""),
+        "company_domain": str(company.get("domain") or ""),
+        "linkedin": str(social.get("linkedin") or social.get("linkedinUrl") or ""),
+        "raw": result,
+    }
+
+
+def enrich_with_lusha(rows: list[dict], lusha_key: str, abstract_key: str, mode: str,
+                      reveal_phone: bool, cross_verify_email: bool, delay: float,
+                      errors: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Abstract sonrası gereken kayıtları Lusha ile toplu zenginleştirir."""
+    if not lusha_key.strip() or mode == "off" or not rows:
+        for row in rows:
+            row.setdefault("Lusha Durumu", "Kullanılmadı")
+        return rows, []
+
+    payload_items: list[dict] = []
+    ref_to_index: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        abstract_status = str(row.get("Doğrulama Durumu") or "").lower()
+        should_query = mode == "all" or abstract_status != "deliverable"
+        if not should_query:
+            row["Lusha Durumu"] = "Atlandı — Abstract doğrulandı"
+            continue
+        ref = f"reset-{index}"
+        first, last = split_name_for_lusha(str(row.get("Ad Soyad") or ""))
+        contact: dict = {"clientReferenceId": ref}
+        linkedin = str(row.get("LinkedIn") or "").strip()
+        current_email = str(row.get("Önerilen E-posta") or "").strip()
+        domain = str(row.get("Şirket Domaini") or "").strip()
+        company = str(row.get("Firma") or "").strip()
+        if linkedin:
+            contact["linkedinUrl"] = linkedin
+        elif current_email and abstract_status in {"deliverable", "catch_all", "unknown"}:
+            contact["email"] = current_email
+        else:
+            if first:
+                contact["firstName"] = first
+            if last:
+                contact["lastName"] = last
+            if domain:
+                contact["companyDomain"] = domain
+            elif company:
+                contact["companyName"] = company
+        if len(contact) <= 1:
+            row["Lusha Durumu"] = "Atlandı — yetersiz kimlik bilgisi"
+            continue
+        payload_items.append(contact)
+        ref_to_index[ref] = index
+        row["Lusha Durumu"] = "Sorgulanıyor"
+
+    billing_rows: list[dict] = []
+    for start in range(0, len(payload_items), 100):
+        chunk = payload_items[start:start + 100]
+        try:
+            response = lusha_search_and_enrich(
+                lusha_key, chunk, reveal_email=True, reveal_phone=reveal_phone
+            )
+        except Exception as exc:
+            for item in chunk:
+                idx = ref_to_index.get(str(item.get("clientReferenceId")))
+                if idx is not None:
+                    rows[idx]["Lusha Durumu"] = "API hatası"
+                    rows[idx]["Lusha Hata"] = str(exc)
+                    errors.append({
+                        "Firma": rows[idx].get("Firma", ""),
+                        "Ad Soyad": rows[idx].get("Ad Soyad", ""),
+                        "Aşama": "Lusha",
+                        "Hata": str(exc),
+                    })
+            continue
+
+        billing = response.get("billing") or {}
+        if billing:
+            billing_rows.append({"Batch": start // 100 + 1, "Billing": json.dumps(billing, ensure_ascii=False)})
+
+        seen: set[str] = set()
+        for raw_result in response.get("results", []):
+            ref = str(raw_result.get("clientReferenceId") or "")
+            seen.add(ref)
+            idx = ref_to_index.get(ref)
+            if idx is None:
+                continue
+            row = rows[idx]
+            parsed = parse_lusha_result(raw_result)
+            if parsed.get("status") == "not_found":
+                row["Lusha Durumu"] = "Bulunamadı"
+                row["Lusha Hata Kodu"] = parsed.get("error_code", "")
+                continue
+            if parsed.get("status") == "error":
+                row["Lusha Durumu"] = "Hata"
+                row["Lusha Hata Kodu"] = parsed.get("error_code", "")
+                row["Lusha Hata"] = parsed.get("error_message", "")
+                continue
+
+            match_score, match_label = lusha_match_score(
+                str(row.get("Ad Soyad") or ""),
+                str(row.get("Firma") or ""),
+                str(row.get("LinkedIn") or ""),
+                raw_result,
+            )
+            row.update({
+                "Lusha Durumu": "Başarılı",
+                "Lusha ID": parsed.get("id", ""),
+                "Lusha Eşleşme": match_label,
+                "Lusha Eşleşme Skoru": match_score,
+                "Lusha E-posta": parsed.get("email", ""),
+                "Lusha E-posta Tipi": parsed.get("email_type", ""),
+                "Lusha E-posta Güveni": parsed.get("email_confidence", ""),
+                "Lusha E-posta Güncelleme": parsed.get("email_updated", ""),
+                "Lusha Telefon": parsed.get("phone", ""),
+                "Lusha Do Not Call": parsed.get("do_not_call", False),
+                "Lusha Güncel Unvan": parsed.get("job_title", ""),
+                "Lusha Kıdem": parsed.get("job_seniority", ""),
+                "Lusha Şirket": parsed.get("company_name", ""),
+                "Lusha Şirket Domaini": parsed.get("company_domain", ""),
+                "Lusha LinkedIn": parsed.get("linkedin", ""),
+            })
+
+            if match_label == "Düşük":
+                row["Önerilen Aksiyon"] = "Lusha eşleşmesi düşük; kişiyi manuel kontrol et"
+                continue
+
+            lusha_email = str(parsed.get("email") or "").strip().lower()
+            if lusha_email:
+                lusha_check: dict = {}
+                if cross_verify_email and abstract_key.strip():
+                    try:
+                        lusha_check = abstract_verify(abstract_key, lusha_email)
+                    except Exception as exc:
+                        errors.append({
+                            "Firma": row.get("Firma", ""),
+                            "Ad Soyad": row.get("Ad Soyad", ""),
+                            "Aşama": "Lusha e-posta çapraz doğrulama",
+                            "Hata": str(exc),
+                        })
+                row["Lusha SMTP Durumu"] = lusha_check.get("status", "not_checked") if lusha_check else "not_checked"
+                row["Lusha SMTP Geçerli"] = lusha_check.get("smtp", "") if lusha_check else ""
+                row["Lusha Catch-all"] = lusha_check.get("catchall", "") if lusha_check else ""
+
+                if lusha_check.get("status") == "deliverable":
+                    row["Önerilen E-posta"] = lusha_email
+                    row["E-posta Durumu"] = "Lusha + SMTP doğrulandı"
+                    row["Güven"] = "Yüksek"
+                    row["Doğrulama Servisi"] = "Lusha + Abstract API"
+                    row["Doğrulama Durumu"] = "deliverable"
+                    row["SMTP Geçerli"] = lusha_check.get("smtp", "")
+                    row["Catch-all"] = lusha_check.get("catchall", "")
+                    row["Kalite Skoru"] = lusha_check.get("quality", "")
+                    row["Önerilen Aksiyon"] = "Kişiselleştirilmiş e-posta ve LinkedIn teması için kullanılabilir"
+                elif not cross_verify_email or not abstract_key.strip():
+                    row["Önerilen E-posta"] = lusha_email
+                    row["E-posta Durumu"] = "Lusha kayıtlı iş e-postası"
+                    row["Güven"] = "Yüksek" if match_label == "Yüksek" else "Orta"
+                    row["Doğrulama Servisi"] = "Lusha"
+                    row["Doğrulama Durumu"] = "lusha_found"
+                    row["Önerilen Aksiyon"] = "Düşük hacimde kişiselleştirilmiş iletişim için kullanılabilir"
+                elif lusha_check.get("status") in {"catch_all", "unknown"}:
+                    row["Önerilen E-posta"] = lusha_email
+                    row["E-posta Durumu"] = "Lusha bulundu — SMTP belirsiz"
+                    row["Güven"] = "Orta"
+                    row["Doğrulama Servisi"] = "Lusha + Abstract API"
+                    row["Doğrulama Durumu"] = "lusha_found"
+                    row["Önerilen Aksiyon"] = "Toplu gönderme; düşük hacimde kontrollü dene"
+
+            phone = str(parsed.get("phone") or "").strip()
+            if phone:
+                if parsed.get("do_not_call"):
+                    row["Önerilen Telefon"] = ""
+                    row["Telefon Durumu"] = "Lusha Do Not Call — kullanma"
+                else:
+                    row["Önerilen Telefon"] = phone
+                    row["Telefon Durumu"] = "Lusha kaynağı"
+                    if not row.get("Önerilen E-posta"):
+                        row["Önerilen Aksiyon"] = "Telefon ve LinkedIn üzerinden kişiselleştirilmiş temas"
+
+            if delay:
+                time.sleep(min(delay, 0.25))
+
+        for item in chunk:
+            ref = str(item.get("clientReferenceId") or "")
+            if ref not in seen:
+                idx = ref_to_index.get(ref)
+                if idx is not None:
+                    rows[idx]["Lusha Durumu"] = "Yanıtta kayıt yok"
+
+    return rows, billing_rows
+
+
+def enrich_emails(api_key: str, abstract_key: str, source_df: pd.DataFrame, company_col: str, name_col: str,
+                  role_col: str | None, priority_col: str | None, linkedin_col: str | None,
+                  provided_domain_col: str | None, delay: float, max_verifications: int = 4,
+                  lusha_key: str = "", lusha_mode: str = "off", lusha_reveal_phone: bool = False,
+                  lusha_cross_verify: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     work = source_df.copy()
     domain_cache: dict[str, tuple[str, str, str, bool, str, set[str], list[str]]] = {}
     rows: list[dict] = []
@@ -601,7 +920,8 @@ def enrich_emails(api_key: str, abstract_key: str, source_df: pd.DataFrame, comp
             domain_cache[company] = ("", "Hata", "", False, "", set(), [])
         step += 1
         progress.progress(min(1.0, step / max(total_steps, 1)))
-        if delay: time.sleep(delay)
+        if delay:
+            time.sleep(delay)
 
     for _, original in work.iterrows():
         company = str(original.get(company_col, "") or "").strip()
@@ -643,12 +963,12 @@ def enrich_emails(api_key: str, abstract_key: str, source_df: pd.DataFrame, comp
         elif verification_status == "unknown":
             status_label = "Doğrulama belirsiz"
             confidence = "Düşük"
-            action = "Göndermeden önce ikinci bir servisle doğrula"
+            action = "Lusha veya ikinci bir kaynakla doğrula"
         elif abstract_key.strip() and verification_status == "undeliverable":
             status_label = "Adaylar doğrulanamadı"
             confidence = "Düşük"
             selected = ""
-            action = "E-posta kullanma; LinkedIn üzerinden temas et"
+            action = "Lusha fallback veya LinkedIn teması kullan"
         elif public_email:
             status_label = "Açık kaynakta bulundu — doğrulanmadı"
             confidence = "Orta"
@@ -664,12 +984,10 @@ def enrich_emails(api_key: str, abstract_key: str, source_df: pd.DataFrame, comp
         else:
             status_label = "Bulunamadı"
             confidence = "Düşük"
-            action = "LinkedIn üzerinden temas et"
+            action = "Lusha fallback veya LinkedIn teması kullan"
 
         chosen_check = next((x for x in verification_checks if x.get("email") == selected), {})
-        check_summary = " | ".join(
-            f"{x.get('email')}: {x.get('status')}" for x in verification_checks
-        )
+        check_summary = " | ".join(f"{x.get('email')}: {x.get('status')}" for x in verification_checks)
         row = {
             "Firma": company,
             "Ad Soyad": name,
@@ -699,13 +1017,24 @@ def enrich_emails(api_key: str, abstract_key: str, source_df: pd.DataFrame, comp
             "Tavily Arama Sorgusu": search_query,
             "Önerilen Aksiyon": action,
             "İletişim Durumu": "Araştırıldı",
+            "Önerilen Telefon": "",
+            "Telefon Durumu": "",
+            "Lusha Durumu": "Bekliyor" if lusha_mode != "off" else "Kullanılmadı",
         }
         rows.append(row)
         step += 1
         progress.progress(min(1.0, step / max(total_steps, 1)))
-        if delay: time.sleep(delay)
-    status.success(f"E-posta araştırması tamamlandı: {len(rows)} kişi işlendi.")
-    return pd.DataFrame(rows), pd.DataFrame(errors)
+        if delay:
+            time.sleep(delay)
+
+    if lusha_mode != "off" and lusha_key.strip():
+        status.write("**Lusha** · başarısız veya seçili kayıtlar toplu zenginleştiriliyor")
+    rows, billing_rows = enrich_with_lusha(
+        rows, lusha_key, abstract_key, lusha_mode, lusha_reveal_phone,
+        lusha_cross_verify, delay, errors,
+    )
+    status.success(f"Hibrit araştırma tamamlandı: {len(rows)} kişi işlendi.")
+    return pd.DataFrame(rows), pd.DataFrame(errors), pd.DataFrame(billing_rows)
 
 
 
@@ -724,7 +1053,8 @@ def read_uploaded_sheet(uploaded_file, widget_key: str, preferred: list[str]) ->
     return pd.read_excel(xls, sheet_name=sheet_name), sheet_name
 
 
-def standardize_previous_results(previous_df: pd.DataFrame) -> pd.DataFrame:
+
+def standardize_previous_results(previous_df: pd.DataFrame, lusha_policy: str = "off") -> pd.DataFrame:
     if previous_df is None or previous_df.empty:
         return pd.DataFrame()
     company_col = next((c for c in ["Firma", "Şirket"] if c in previous_df.columns), None)
@@ -733,15 +1063,22 @@ def standardize_previous_results(previous_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = previous_df.copy()
     out["__key"] = [record_key(c, n) for c, n in zip(out[company_col], out[name_col])]
-    status_col = "Doğrulama Durumu" if "Doğrulama Durumu" in out.columns else None
+    status = out.get("Doğrulama Durumu", pd.Series("", index=out.index)).astype(str).str.lower()
     email_col = "Önerilen E-posta" if "Önerilen E-posta" in out.columns else ("E-posta" if "E-posta" in out.columns else None)
-    if status_col:
-        out["__done"] = out[status_col].astype(str).str.lower().isin(["deliverable", "catch_all", "unknown", "undeliverable"])
-    elif email_col:
-        out["__done"] = out[email_col].fillna("").astype(str).str.contains("@")
+    has_email = out[email_col].fillna("").astype(str).str.contains("@") if email_col else pd.Series(False, index=out.index)
+    lusha_status = out.get("Lusha Durumu", pd.Series("", index=out.index)).astype(str).str.lower()
+    lusha_attempted = lusha_status.isin(["başarılı", "bulunamadı", "hata", "yanıtta kayıt yok", "atlandı — yetersiz kimlik bilgisi"])
+
+    if lusha_policy == "all":
+        # Önceki Abstract sonuçlarını Lusha ile ayrıca çapraz kontrol etmek için yeniden aç.
+        out["__done"] = lusha_attempted
+    elif lusha_policy == "fallback":
+        # Abstract deliverable kayıtları tamam; diğerleri Lusha sorgulanmışsa tamam.
+        out["__done"] = status.eq("deliverable") | lusha_attempted
     else:
-        out["__done"] = False
+        out["__done"] = status.isin(["deliverable", "catch_all", "unknown", "undeliverable", "lusha_found"]) | has_email
     return out
+
 
 
 def merge_result_frames(previous: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
@@ -761,6 +1098,7 @@ def merge_result_frames(previous: pd.DataFrame, new: pd.DataFrame) -> pd.DataFra
     return combined
 
 
+
 def build_crm_sheet(target_df: pd.DataFrame, company_col: str, name_col: str, role_col: str | None,
                     priority_col: str | None, linkedin_col: str | None, combined_results: pd.DataFrame) -> pd.DataFrame:
     base = pd.DataFrame({
@@ -771,30 +1109,54 @@ def build_crm_sheet(target_df: pd.DataFrame, company_col: str, name_col: str, ro
         "LinkedIn": target_df[linkedin_col].fillna("").astype(str).str.strip() if linkedin_col else "",
     })
     base["__key"] = [record_key(c, n) for c, n in zip(base["Firma"], base["Ad Soyad"])]
+    merge_columns = [
+        "__key", "Şirket Domaini", "Önerilen E-posta", "E-posta Durumu", "Güven",
+        "Doğrulama Durumu", "SMTP Geçerli", "Catch-all", "Kalite Skoru",
+        "Önerilen Aksiyon", "İletişim Durumu", "MX Durumu", "Domain Kaynağı",
+        "Önerilen Telefon", "Telefon Durumu", "Lusha Durumu", "Lusha ID",
+        "Lusha Eşleşme", "Lusha Eşleşme Skoru", "Lusha E-posta", "Lusha E-posta Güveni",
+        "Lusha Telefon", "Lusha Do Not Call", "Lusha Güncel Unvan", "Lusha Şirket",
+        "Lusha LinkedIn", "Lusha SMTP Durumu",
+    ]
     if combined_results is not None and not combined_results.empty and "__key" in combined_results.columns:
-        available = [c for c in [
-            "__key", "Şirket Domaini", "Önerilen E-posta", "E-posta Durumu", "Güven",
-            "Doğrulama Durumu", "SMTP Geçerli", "Catch-all", "Kalite Skoru",
-            "Önerilen Aksiyon", "İletişim Durumu", "MX Durumu", "Domain Kaynağı"
-        ] if c in combined_results.columns]
+        available = [c for c in merge_columns if c in combined_results.columns]
         lookup = combined_results[available].drop_duplicates("__key", keep="last")
         base = base.merge(lookup, on="__key", how="left")
-    for col in ["Şirket Domaini", "Önerilen E-posta", "E-posta Durumu", "Güven", "Doğrulama Durumu", "SMTP Geçerli", "Catch-all", "Kalite Skoru", "Önerilen Aksiyon", "MX Durumu", "Domain Kaynağı"]:
+    for col in merge_columns[1:]:
         if col not in base.columns:
             base[col] = ""
+
     def crm_status(row) -> str:
         status = str(row.get("Doğrulama Durumu", "") or "").lower()
-        if status == "deliverable": return "İletişime hazır"
-        if status in {"catch_all", "unknown"}: return "Manuel kontrol"
-        if status == "undeliverable": return "LinkedIn teması"
+        phone = str(row.get("Önerilen Telefon", "") or "").strip()
+        if status in {"deliverable", "lusha_found"}:
+            return "İletişime hazır"
+        if phone:
+            return "Telefon hazır"
+        if status in {"catch_all", "unknown"}:
+            return "Manuel kontrol"
+        if status == "undeliverable" or str(row.get("Lusha Durumu", "")).lower() == "bulunamadı":
+            return "LinkedIn teması"
         return "Araştırılacak"
+
     base["CRM Durumu"] = base.apply(crm_status, axis=1)
-    base["Kullanılacak Kanal"] = base["CRM Durumu"].map({
-        "İletişime hazır": "E-posta + LinkedIn",
-        "Manuel kontrol": "LinkedIn + kontrollü e-posta",
-        "LinkedIn teması": "LinkedIn",
-        "Araştırılacak": "Araştırılacak",
-    })
+
+    def channel(row) -> str:
+        email = str(row.get("Önerilen E-posta", "") or "").strip()
+        phone = str(row.get("Önerilen Telefon", "") or "").strip()
+        if email and phone:
+            return "E-posta + Telefon + LinkedIn"
+        if email:
+            return "E-posta + LinkedIn"
+        if phone:
+            return "Telefon + LinkedIn"
+        if row.get("CRM Durumu") == "Manuel kontrol":
+            return "LinkedIn + kontrollü e-posta"
+        if row.get("CRM Durumu") == "LinkedIn teması":
+            return "LinkedIn"
+        return "Araştırılacak"
+
+    base["Kullanılacak Kanal"] = base.apply(channel, axis=1)
     base["İlk Temas Tarihi"] = ""
     base["Yanıt Durumu"] = "Bekliyor"
     base["Takip Tarihi"] = ""
@@ -806,13 +1168,17 @@ def build_crm_sheet(target_df: pd.DataFrame, company_col: str, name_col: str, ro
 
 
 def build_summary(crm: pd.DataFrame, combined: pd.DataFrame) -> pd.DataFrame:
-    deliverable = int((crm.get("Doğrulama Durumu", pd.Series(dtype=str)).astype(str).str.lower() == "deliverable").sum())
-    catchall = int(crm.get("Doğrulama Durumu", pd.Series(dtype=str)).astype(str).str.lower().isin(["catch_all", "unknown"]).sum())
-    undeliverable = int((crm.get("Doğrulama Durumu", pd.Series(dtype=str)).astype(str).str.lower() == "undeliverable").sum())
+    statuses = crm.get("CRM Durumu", pd.Series(dtype=str)).astype(str)
+    ready = int(statuses.isin(["İletişime hazır", "Telefon hazır"]).sum())
+    manual = int((statuses == "Manuel kontrol").sum())
+    linkedin = int((statuses == "LinkedIn teması").sum())
+    waiting = int((statuses == "Araştırılacak").sum())
+    lusha_success = int((crm.get("Lusha Durumu", pd.Series(dtype=str)).astype(str) == "Başarılı").sum())
     return pd.DataFrame({
-        "Metrik": ["Toplam hedef kişi", "İletişime hazır", "Manuel kontrol", "Doğrulanamadı", "Araştırılmayı bekleyen"],
-        "Değer": [len(crm), deliverable, catchall, undeliverable, max(0, len(crm) - deliverable - catchall - undeliverable)],
+        "Metrik": ["Toplam hedef kişi", "İletişime hazır", "Manuel kontrol", "LinkedIn teması", "Araştırılmayı bekleyen", "Lusha başarılı"],
+        "Değer": [len(crm), ready, manual, linkedin, waiting, lusha_success],
     })
+
 
 st.set_page_config(page_title="RE:SET Lead Intelligence", page_icon="R", layout="wide", initial_sidebar_state="expanded")
 
@@ -916,6 +1282,7 @@ st.markdown(
         <span class="reset-chip"><span class="reset-dot"></span> Cloud online</span>
         <span class="reset-chip">People discovery</span>
         <span class="reset-chip">Email verification</span>
+        <span class="reset-chip">Lusha fallback</span>
         <span class="reset-chip">CRM export</span>
       </div>
     </section>
@@ -925,9 +1292,10 @@ st.markdown(
 
 stored_tavily_key = get_secret("TAVILY_API_KEY")
 stored_abstract_key = get_secret("ABSTRACT_API_KEY")
+stored_lusha_key = get_secret("LUSHA_API_KEY")
 
 with st.sidebar:
-    st.markdown("""<div class="reset-side-brand"><div class="reset-side-mark">RE<span>:</span>SET</div><div class="reset-side-caption">Lead Intelligence · v9</div></div>""", unsafe_allow_html=True)
+    st.markdown("""<div class="reset-side-brand"><div class="reset-side-mark">RE<span>:</span>SET</div><div class="reset-side-caption">Lead Intelligence · v10</div></div>""", unsafe_allow_html=True)
     st.header("Bağlantılar")
     if stored_tavily_key:
         api_key = stored_tavily_key
@@ -941,6 +1309,12 @@ with st.sidebar:
     else:
         abstract_key = st.text_input("Abstract Email Reputation API anahtarı", type="password", help="Sunucu secret tanımlı değilse bu oturum için girilir.")
         st.markdown("[Abstract paneli](https://app.abstractapi.com/)")
+    if stored_lusha_key:
+        lusha_key = stored_lusha_key
+        st.success("Lusha API bağlı")
+    else:
+        lusha_key = st.text_input("Lusha API anahtarı — isteğe bağlı", type="password", help="Lusha API erişimin varsa gir. Abstract başarısız olduğunda devreye girer.")
+        st.markdown("[Lusha API ayarları](https://dashboard.lusha.com/)")
     st.divider()
     st.caption("API anahtarları kaynak koduna yazılmaz. Bulut dağıtımında Secrets/Environment Variables bölümünde saklanır.")
     if get_secret("APP_PASSWORD") and st.button("Oturumu kapat", use_container_width=True):
@@ -1000,7 +1374,7 @@ with people_tab:
         st.download_button("Kişi Excel’ini indir", data=excel_bytes({"Bulunan Kişiler": results_df}), file_name="reset_bulunan_kisiler.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 with email_tab:
-    st.success("Devam modu: Önceki sonuç dosyasını yüklediğinde doğrulanmış kişileri otomatik atlar ve yalnızca kalanları işler.")
+    st.success("Hibrit mod: Tavily + Abstract ana akışıdır. İstersen Abstract başarısız olduğunda Lusha e-posta/telefon verisiyle tamamlar.")
     target_upload = st.file_uploader("1) Öncelikli kişiler dosyası", type=["xlsx", "xls", "csv"], key="target_email_file")
     previous_upload = st.file_uploader("2) Önceki e-posta sonuçları — isteğe bağlı", type=["xlsx", "xls", "csv"], key="previous_email_file")
 
@@ -1017,7 +1391,27 @@ with email_tab:
         previous_df = pd.DataFrame()
         if previous_upload is not None:
             previous_df, _ = read_uploaded_sheet(previous_upload, "previous_sheet", ["E-posta Sonuçları", "CRM"])
-        previous_std = standardize_previous_results(previous_df)
+
+        st.subheader("Lusha hibrit katmanı")
+        lusha_options = ["Kapalı", "Sadece Abstract başarısız veya belirsizse", "Tüm seçili kişilerde çapraz kontrol"]
+        default_lusha_index = 1 if lusha_key.strip() else 0
+        lusha_choice = st.radio("Lusha kullanım biçimi", lusha_options, index=default_lusha_index, horizontal=True, key="lusha_mode")
+        lusha_policy = {
+            "Kapalı": "off",
+            "Sadece Abstract başarısız veya belirsizse": "fallback",
+            "Tüm seçili kişilerde çapraz kontrol": "all",
+        }[lusha_choice]
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            lusha_reveal_phone = st.toggle("Lusha'dan telefon verisini de getir", value=False, disabled=lusha_policy == "off", key="lusha_phone")
+        with lc2:
+            lusha_cross_verify = st.toggle("Lusha e-postasını Abstract ile çapraz doğrula", value=True, disabled=lusha_policy == "off", key="lusha_cross")
+        if lusha_policy != "off" and not lusha_key.strip():
+            st.warning("Lusha modu seçili ancak LUSHA_API_KEY tanımlı değil. Streamlit Secrets'a ekle veya soldaki alana gir.")
+        if lusha_reveal_phone:
+            st.warning("Telefon açma daha fazla Lusha kredisi tüketebilir. Do Not Call işaretli numaralar önerilen telefon alanına alınmaz.")
+
+        previous_std = standardize_previous_results(previous_df, lusha_policy)
 
         columns = list(email_df.columns)
         def idx(names: list[str], default: int = 0) -> int:
@@ -1069,14 +1463,16 @@ with email_tab:
             delay = st.slider("Sorgular arası bekleme (sn)", 0.0, 1.5, 0.25, 0.05, key="resume_delay")
             batch = remaining.head(int(batch_size)).copy()
             unique_companies = batch[company_col].dropna().astype(str).nunique()
-            e1, e2 = st.columns(2)
+            e1, e2, e3 = st.columns(3)
             e1.metric("Tahmini Tavily kredisi", len(batch) + unique_companies)
             e2.metric("Azami Abstract doğrulaması", len(batch) * int(max_verifications))
+            e3.metric("Azami Lusha kişisi", len(batch) if lusha_policy != "off" else 0)
             st.dataframe(batch.drop(columns=[c for c in ["__key", "__processed", "__p"] if c in batch.columns]), use_container_width=True, hide_index=True)
 
-            if st.button("Kalan kişileri araştır", type="primary", use_container_width=True):
+            if st.button("Hibrit araştırmayı başlat", type="primary", use_container_width=True):
                 if not api_key.strip(): st.error("Tavily API anahtarını gir."); st.stop()
                 if not abstract_key.strip(): st.error("Abstract Email Reputation API anahtarını gir."); st.stop()
+                if lusha_policy != "off" and not lusha_key.strip(): st.error("Lusha modu için LUSHA_API_KEY gerekli."); st.stop()
 
                 # Önceki sonuçlardaki şirket domainlerini yeni batch'e taşı; gereksiz Tavily domain sorgusunu azaltır.
                 run_batch = batch.copy()
@@ -1087,7 +1483,7 @@ with email_tab:
                     if run_batch["__Resume Domain"].astype(str).str.len().gt(0).any():
                         resume_domain_col = "__Resume Domain"
 
-                results, errors = enrich_emails(
+                results, errors, lusha_billing = enrich_emails(
                     api_key, abstract_key, run_batch, company_col, name_col,
                     None if role_col == "— Yok —" else role_col,
                     None if priority_col == "— Yok —" else priority_col,
@@ -1095,9 +1491,14 @@ with email_tab:
                     resume_domain_col if resume_domain_col else (None if domain_col == "— Yok —" else domain_col),
                     delay,
                     int(max_verifications),
+                    lusha_key=lusha_key,
+                    lusha_mode=lusha_policy,
+                    lusha_reveal_phone=lusha_reveal_phone,
+                    lusha_cross_verify=lusha_cross_verify,
                 )
                 st.session_state["resume_new_results"] = results
                 st.session_state["resume_errors"] = errors
+                st.session_state["lusha_billing"] = lusha_billing
 
         new_results = st.session_state.get("resume_new_results", pd.DataFrame())
         combined = merge_result_frames(previous_std, new_results)
@@ -1110,18 +1511,19 @@ with email_tab:
         )
         summary_df = build_summary(crm, combined)
         remaining_crm = crm[crm["CRM Durumu"] == "Araştırılacak"].copy()
-        verified_crm = crm[crm["CRM Durumu"] == "İletişime hazır"].copy()
+        verified_crm = crm[crm["CRM Durumu"].isin(["İletişime hazır", "Telefon hazır"])].copy()
 
         if not new_results.empty:
             st.subheader("Bu turdaki sonuçlar")
-            cols = [c for c in ["Firma", "Ad Soyad", "Rol", "Önerilen E-posta", "E-posta Durumu", "Doğrulama Durumu", "SMTP Geçerli", "Catch-all", "Güven", "LinkedIn"] if c in new_results.columns]
+            cols = [c for c in ["Firma", "Ad Soyad", "Rol", "Önerilen E-posta", "E-posta Durumu", "Önerilen Telefon", "Telefon Durumu", "Lusha Durumu", "Lusha Eşleşme", "Lusha Güncel Unvan", "Doğrulama Durumu", "SMTP Geçerli", "Güven", "LinkedIn"] if c in new_results.columns]
             st.dataframe(new_results[cols], use_container_width=True, hide_index=True, column_config={"LinkedIn": st.column_config.LinkColumn("LinkedIn")})
 
         st.subheader("Nihai CRM özeti")
-        s1, s2, s3 = st.columns(3)
+        s1, s2, s3, s4 = st.columns(4)
         s1.metric("İletişime hazır", len(verified_crm))
         s2.metric("Araştırılacak", len(remaining_crm))
-        s3.metric("Toplam hedef", len(crm))
+        s3.metric("Lusha başarılı", int((crm.get("Lusha Durumu", pd.Series(dtype=str)) == "Başarılı").sum()))
+        s4.metric("Toplam hedef", len(crm))
 
         sheets = {
             "CRM": crm,
@@ -1133,6 +1535,9 @@ with email_tab:
         errors = st.session_state.get("resume_errors", pd.DataFrame())
         if not errors.empty:
             sheets["Hatalar"] = errors
+        lusha_billing = st.session_state.get("lusha_billing", pd.DataFrame())
+        if not lusha_billing.empty:
+            sheets["Lusha Billing"] = lusha_billing
         st.download_button(
             "Nihai CRM Excel’ini indir",
             data=excel_bytes(sheets),
@@ -1143,4 +1548,4 @@ with email_tab:
         )
 
 st.divider()
-st.caption("Araç LinkedIn hesabına giriş yapmaz. Yalnızca herkese açık arama sonuçlarını, şirketlerin resmi web sitelerini ve kurumsal e-posta formatlarını kullanır.")
+st.caption("Araç LinkedIn hesabına giriş yapmaz. Açık web kaynakları, kurumsal e-posta doğrulaması ve isteğe bağlı Lusha API zenginleştirmesi kullanır. Do Not Call işaretli telefonları kullanmayın.")
